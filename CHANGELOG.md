@@ -45,6 +45,11 @@ The changes are relative to the previous release, unless the baseline is specifi
   specific data after the entity_id array are no longer rejected.
 * Reset Sample Transform decoder state in avifDecoderReset() so repeated resets
   and avifDecoderSetSource() calls do not fail.
+* With AVIF_DECODER_SOURCE_AUTO, fall back to the available representation when
+  the source preferred by the major brand is missing (for example decode the
+  image sequence track when an "avif" file has no primary image item). An
+  explicitly requested source is still honored as-is and reports its
+  unavailability instead of being silently substituted.
 * Support a 'thmb', 'auxl', 'cdsc' or 'prem' item reference that links one item
   to several items. Only the target parsed last used to be kept, silently
   dropping the others.

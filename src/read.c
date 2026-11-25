@@ -6196,6 +6196,33 @@ static avifResult avifReadCodecConfigProperty(avifImage * image, const avifPrope
     return AVIF_RESULT_OK;
 }
 
+// Returns AVIF_TRUE if the parsed metadata offers a decodable primary image item.
+static avifBool avifDecoderHasPrimaryItem(const avifDecoderData * data)
+{
+    return data->meta->primaryItemID != 0 && avifMetaFindColorItem(data->meta) != NULL;
+}
+
+// Returns AVIF_TRUE if the parsed file offers a decodable image sequence track (a non-auxiliary
+// track carrying a supported codec). Mirrors the color-track lookup performed in
+// avifDecoderReset() when AVIF_DECODER_SOURCE_TRACKS is selected.
+static avifBool avifDecoderHasImageSequenceTrack(const avifDecoderData * data)
+{
+    for (uint32_t trackIndex = 0; trackIndex < data->tracks.count; ++trackIndex) {
+        const avifTrack * track = &data->tracks.track[trackIndex];
+        if (!track->sampleTable || !track->id || !track->sampleTable->chunks.count) {
+            continue;
+        }
+        if (avifSampleTableGetCodecType(track->sampleTable) == AVIF_CODEC_TYPE_UNKNOWN) {
+            continue;
+        }
+        if (avifHasReference(&track->references, "auxl")) {
+            continue;
+        }
+        return AVIF_TRUE;
+    }
+    return AVIF_FALSE;
+}
+
 avifResult avifDecoderReset(avifDecoder * decoder)
 {
     avifDiagnosticsClearError(&decoder->diag);
@@ -6235,18 +6262,31 @@ avifResult avifDecoderReset(avifDecoder * decoder)
     // Build decode input
 
     data->sourceSampleTable = NULL; // Reset
+
+    const avifBool hasPrimaryItem = avifDecoderHasPrimaryItem(data);
+    const avifBool hasImageSequenceTrack = avifDecoderHasImageSequenceTrack(data);
     if (decoder->requestedSource == AVIF_DECODER_SOURCE_AUTO) {
-        // Honor the major brand (avif or avis) if present, otherwise prefer avis (tracks) if possible.
+        // Honor the major brand (avif or avis) to pick a preferred source, then fall back to the
+        // other representation if the preferred one is not actually available. If the major brand
+        // is neither of these, prefer the image sequence (tracks) when present. This keeps AUTO
+        // working by the format's default convention even when one representation is missing.
+        avifDecoderSource preferredSource;
         if (!memcmp(data->majorBrand, "avis", 4)) {
-            data->source = AVIF_DECODER_SOURCE_TRACKS;
+            preferredSource = AVIF_DECODER_SOURCE_TRACKS;
         } else if (!memcmp(data->majorBrand, "avif", 4)) {
-            data->source = AVIF_DECODER_SOURCE_PRIMARY_ITEM;
-        } else if (data->tracks.count > 0) {
-            data->source = AVIF_DECODER_SOURCE_TRACKS;
+            preferredSource = AVIF_DECODER_SOURCE_PRIMARY_ITEM;
         } else {
-            data->source = AVIF_DECODER_SOURCE_PRIMARY_ITEM;
+            preferredSource = hasImageSequenceTrack ? AVIF_DECODER_SOURCE_TRACKS : AVIF_DECODER_SOURCE_PRIMARY_ITEM;
+        }
+
+        if (preferredSource == AVIF_DECODER_SOURCE_TRACKS) {
+            data->source = hasImageSequenceTrack ? AVIF_DECODER_SOURCE_TRACKS : AVIF_DECODER_SOURCE_PRIMARY_ITEM;
+        } else {
+            data->source = hasPrimaryItem ? AVIF_DECODER_SOURCE_PRIMARY_ITEM : AVIF_DECODER_SOURCE_TRACKS;
         }
     } else {
+        // An explicitly requested source is honored as-is so that its unavailability is reported
+        // back to the caller instead of being silently substituted.
         data->source = decoder->requestedSource;
     }
 

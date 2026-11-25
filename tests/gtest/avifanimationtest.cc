@@ -369,6 +369,240 @@ TEST(AvifDecodeTest, AnimatedImageWithoutTracksShouldFail) {
   }
 }
 
+// A file holding both representations must report the geometry, image count
+// and transforms of whichever source is currently selected. Switching back
+// and forth must not leave any state from the previous source behind.
+TEST(AvifDecodeTest, SourceSwitchingKeepsEachSourceState) {
+  if (!testutil::Av1DecoderAvailable()) {
+    GTEST_SKIP() << "AV1 Codec unavailable, skip test.";
+  }
+  const char* file_name = "colors-animated-8bpc.avif";
+  DecoderPtr decoder(avifDecoderCreate());
+  ASSERT_NE(decoder, nullptr);
+  ASSERT_EQ(avifDecoderSetIOFile(
+                decoder.get(), (std::string(data_path) + file_name).c_str()),
+            AVIF_RESULT_OK);
+  ASSERT_EQ(avifDecoderParse(decoder.get()), AVIF_RESULT_OK);
+
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    // The still primary item is a single image.
+    ASSERT_EQ(
+        avifDecoderSetSource(decoder.get(), AVIF_DECODER_SOURCE_PRIMARY_ITEM),
+        AVIF_RESULT_OK);
+    EXPECT_EQ(decoder->imageCount, 1);
+    const uint32_t primaryWidth = decoder->image->width;
+    const uint32_t primaryHeight = decoder->image->height;
+    const avifTransformFlags primaryTransforms = decoder->image->transformFlags;
+    EXPECT_EQ(avifDecoderNextImage(decoder.get()), AVIF_RESULT_OK);
+    EXPECT_EQ(decoder->image->width, primaryWidth);
+    EXPECT_EQ(decoder->image->height, primaryHeight);
+    EXPECT_EQ(decoder->image->transformFlags, primaryTransforms);
+
+    // The image sequence exposes all of its frames instead.
+    ASSERT_EQ(
+        avifDecoderSetSource(decoder.get(), AVIF_DECODER_SOURCE_TRACKS),
+        AVIF_RESULT_OK);
+    EXPECT_GT(decoder->imageCount, 1);
+    const uint32_t trackWidth = decoder->image->width;
+    const uint32_t trackHeight = decoder->image->height;
+    const avifTransformFlags trackTransforms = decoder->image->transformFlags;
+    EXPECT_EQ(avifDecoderNextImage(decoder.get()), AVIF_RESULT_OK);
+    EXPECT_EQ(decoder->image->width, trackWidth);
+    EXPECT_EQ(decoder->image->height, trackHeight);
+    EXPECT_EQ(decoder->image->transformFlags, trackTransforms);
+  }
+}
+
+// An explicit request for a representation that the file does not contain has
+// to fail, while AVIF_DECODER_SOURCE_AUTO keeps working by falling back to the
+// available representation instead.
+TEST(AvifDecodeTest, ExplicitUnavailableSourceFailsButAutoFallsBack) {
+  if (!testutil::Av1EncoderAvailable() || !testutil::Av1DecoderAvailable()) {
+    GTEST_SKIP() << "AV1 Codec unavailable, skip test.";
+  }
+  const ImagePtr still = testutil::CreateImage(
+      /*width=*/12, /*height=*/10, /*depth=*/8, AVIF_PIXEL_FORMAT_YUV444,
+      AVIF_PLANES_YUV);
+  ASSERT_NE(still, nullptr);
+  testutil::FillImageGradient(still.get());
+  const testutil::AvifRwData encoded =
+      testutil::Encode(still.get(), AVIF_SPEED_FASTEST, /*quality=*/40);
+  ASSERT_NE(encoded.size, size_t{0});
+  // The still file has no image sequence track.
+  ASSERT_EQ(encoded.data[8], 'a');
+  ASSERT_EQ(encoded.data[9], 'v');
+  ASSERT_EQ(encoded.data[10], 'i');
+  ASSERT_EQ(encoded.data[11], 'f');
+
+  // Explicitly requesting the tracks must report the failure to the caller once
+  // the decoder has been parsed and knows no image sequence track is present.
+  {
+    DecoderPtr decoder(avifDecoderCreate());
+    ASSERT_NE(decoder, nullptr);
+    ASSERT_EQ(avifDecoderSetIOMemory(decoder.get(), encoded.data, encoded.size),
+              AVIF_RESULT_OK);
+    ASSERT_EQ(avifDecoderParse(decoder.get()), AVIF_RESULT_OK);
+    ASSERT_EQ(
+        avifDecoderSetSource(decoder.get(), AVIF_DECODER_SOURCE_TRACKS),
+        AVIF_RESULT_NO_CONTENT);
+  }
+
+  // Flip the major brand to something other than "avif"/"avis": AUTO then takes
+  // its generic branch, which would prefer tracks if present. Since there is no
+  // track, it has to fall back to the primary item and still decode.
+  testutil::AvifRwData rewritten;
+  ASSERT_EQ(avifRWDataSet(&rewritten, encoded.data, encoded.size),
+            AVIF_RESULT_OK);
+  std::memcpy(rewritten.data + 8, "zzzz", 4);
+  {
+    DecoderPtr decoder(avifDecoderCreate());
+    ASSERT_NE(decoder, nullptr);
+    ASSERT_EQ(
+        avifDecoderSetIOMemory(decoder.get(), rewritten.data, rewritten.size),
+        AVIF_RESULT_OK);
+    ASSERT_EQ(avifDecoderParse(decoder.get()), AVIF_RESULT_OK);
+    EXPECT_EQ(decoder->imageCount, 1);
+    EXPECT_EQ(decoder->image->width, 12u);
+    EXPECT_EQ(decoder->image->height, 10u);
+    EXPECT_EQ(avifDecoderNextImage(decoder.get()), AVIF_RESULT_OK);
+  }
+}
+
+// Encodes an image sequence and writes, into |out|, the bytes after removing
+// its primary image item so that only the image sequence track remains. The
+// 'meta' box is replaced in place (a minimal, item-less meta plus a padding
+// 'free' box of the same total size), so every absolute chunk offset elsewhere
+// in the file stays valid, and the major brand is set to "avif" so AUTO would
+// normally prefer the (now missing) primary item.
+static void EncodeSequenceWithoutPrimaryItem(testutil::AvifRwData* out) {
+  constexpr uint32_t kWidth = 14;
+  constexpr uint32_t kHeight = 11;
+  constexpr int kFrameCount = 3;
+
+  EncoderPtr encoder(avifEncoderCreate());
+  ASSERT_NE(encoder, nullptr);
+  encoder->speed = AVIF_SPEED_FASTEST;
+  encoder->quality = 40;
+  encoder->timescale = 30;
+
+  for (int i = 0; i < kFrameCount; ++i) {
+    ImagePtr frame = testutil::CreateImage(
+        kWidth, kHeight, /*depth=*/8, AVIF_PIXEL_FORMAT_YUV444, AVIF_PLANES_YUV);
+    ASSERT_NE(frame, nullptr);
+    testutil::FillImageGradient(frame.get(), /*offset=*/i);
+    ASSERT_EQ(avifEncoderAddImage(encoder.get(), frame.get(),
+                                  /*durationInTimescales=*/1,
+                                  AVIF_ADD_IMAGE_FLAG_NONE),
+              AVIF_RESULT_OK);
+  }
+
+  testutil::AvifRwData sequence;
+  ASSERT_EQ(avifEncoderFinish(encoder.get(), &sequence), AVIF_RESULT_OK);
+
+  // Locate the top-level 'meta' box (it follows 'ftyp'). Box sizes are
+  // big-endian 32-bit integers.
+  size_t metaOffset = 0;
+  uint32_t metaSize = 0;
+  for (size_t offset = 0; offset + 8 <= sequence.size;) {
+    const uint8_t* p = sequence.data + offset;
+    const uint32_t size = (static_cast<uint32_t>(p[0]) << 24) |
+                          (static_cast<uint32_t>(p[1]) << 16) |
+                          (static_cast<uint32_t>(p[2]) << 8) |
+                          static_cast<uint32_t>(p[3]);
+    if (std::memcmp(p + 4, "meta", 4) == 0) {
+      metaOffset = offset;
+      metaSize = size;
+      break;
+    }
+    offset += size;
+  }
+  ASSERT_NE(metaSize, 0u);
+
+  // Build a minimal, valid item-less meta box:
+  //   meta (FullBox: version=0, flags=0) { hdlr (FullBox, handler 'pict') }
+  std::vector<uint8_t> hdlr;
+  const std::vector<uint8_t> hdlrPayload = {
+      0x00, 0x00, 0x00, 0x00,  // version + flags
+      0x00, 0x00, 0x00, 0x00,  // pre_defined
+      'p', 'i', 'c', 't',      // handler_type
+      0x00, 0x00, 0x00, 0x00,  // reserved[3]
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00};                   // empty name
+  hdlr.reserve(8 + hdlrPayload.size());
+  const uint32_t hdlrSize = 8u + static_cast<uint32_t>(hdlrPayload.size());
+  hdlr.push_back(static_cast<uint8_t>(hdlrSize >> 24));
+  hdlr.push_back(static_cast<uint8_t>(hdlrSize >> 16));
+  hdlr.push_back(static_cast<uint8_t>(hdlrSize >> 8));
+  hdlr.push_back(static_cast<uint8_t>(hdlrSize));
+  hdlr.insert(hdlr.end(), {'h', 'd', 'l', 'r'});
+  hdlr.insert(hdlr.end(), hdlrPayload.begin(), hdlrPayload.end());
+
+  std::vector<uint8_t> inner;
+  inner.insert(inner.end(), {0x00, 0x00, 0x00, 0x00});  // meta version + flags
+  inner.insert(inner.end(), hdlr.begin(), hdlr.end());
+  const uint32_t newMetaSize = 8u + static_cast<uint32_t>(inner.size());
+  ASSERT_LE(newMetaSize, metaSize);
+
+  std::vector<uint8_t> replacement;
+  const uint32_t freeSize = metaSize - newMetaSize;
+  ASSERT_GE(freeSize, 8u);  // a 'free' box needs at least a header
+  replacement.reserve(metaSize);
+  replacement.push_back(static_cast<uint8_t>(newMetaSize >> 24));
+  replacement.push_back(static_cast<uint8_t>(newMetaSize >> 16));
+  replacement.push_back(static_cast<uint8_t>(newMetaSize >> 8));
+  replacement.push_back(static_cast<uint8_t>(newMetaSize));
+  replacement.insert(replacement.end(), {'m', 'e', 't', 'a'});
+  replacement.insert(replacement.end(), inner.begin(), inner.end());
+  replacement.push_back(static_cast<uint8_t>(freeSize >> 24));
+  replacement.push_back(static_cast<uint8_t>(freeSize >> 16));
+  replacement.push_back(static_cast<uint8_t>(freeSize >> 8));
+  replacement.push_back(static_cast<uint8_t>(freeSize));
+  replacement.insert(replacement.end(), {'f', 'r', 'e', 'e'});
+  replacement.resize(metaSize, 0);
+  ASSERT_EQ(replacement.size(), metaSize);
+
+  ASSERT_EQ(avifRWDataSet(out, sequence.data, sequence.size), AVIF_RESULT_OK);
+  std::memcpy(out->data + metaOffset, replacement.data(), metaSize);
+  // AUTO would now prefer the primary item; make sure the brand says so.
+  std::memcpy(out->data + 8, "avif", 4);
+}
+
+// The major brand "avif" makes AUTO prefer the primary item, but this file only
+// contains an image sequence track. AUTO must fall back to the track, whereas an
+// explicit primary-item request has to report the missing representation.
+TEST(AvifDecodeTest, AutoFallsBackFromMissingPrimaryItemToTracks) {
+  if (!testutil::Av1EncoderAvailable() || !testutil::Av1DecoderAvailable()) {
+    GTEST_SKIP() << "AV1 Codec unavailable, skip test.";
+  }
+  testutil::AvifRwData avif;
+  EncodeSequenceWithoutPrimaryItem(&avif);
+  ASSERT_NE(avif.size, size_t{0});
+
+  DecoderPtr decoder(avifDecoderCreate());
+  ASSERT_NE(decoder, nullptr);
+  ASSERT_EQ(avifDecoderSetIOMemory(decoder.get(), avif.data, avif.size),
+            AVIF_RESULT_OK);
+
+  // AUTO falls back to the image sequence and exposes every frame.
+  ASSERT_EQ(avifDecoderParse(decoder.get()), AVIF_RESULT_OK);
+  EXPECT_EQ(decoder->imageCount, 3);
+  EXPECT_EQ(decoder->image->width, 14u);
+  EXPECT_EQ(decoder->image->height, 11u);
+
+  // Explicitly asking for the absent primary item must fail rather than silently
+  // substitute the track.
+  EXPECT_EQ(
+      avifDecoderSetSource(decoder.get(), AVIF_DECODER_SOURCE_PRIMARY_ITEM),
+      AVIF_RESULT_MISSING_IMAGE_ITEM);
+
+  // The explicit track selection keeps working after the failed request.
+  ASSERT_EQ(avifDecoderSetSource(decoder.get(), AVIF_DECODER_SOURCE_TRACKS),
+            AVIF_RESULT_OK);
+  EXPECT_EQ(decoder->imageCount, 3);
+  EXPECT_EQ(avifDecoderNextImage(decoder.get()), AVIF_RESULT_OK);
+}
+
 }  // namespace
 }  // namespace avif
 
