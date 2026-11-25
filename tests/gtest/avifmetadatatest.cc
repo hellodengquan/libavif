@@ -427,6 +427,481 @@ TEST(MetadataTest, ExifTiffHeaderOffsetAtEnd) {
 }
 
 //------------------------------------------------------------------------------
+// Metadata rewriting (avifMetadataRewrite): replacing the Exif and XMP payloads of
+// the primary item without re-encoding the coded AV1 samples.
+
+namespace {
+
+// Returns a read-only view of the given bytes.
+avifROData RoData(const testutil::AvifRwData& data) {
+  return avifROData{data.data, data.size};
+}
+avifROData RoData(const std::vector<uint8_t>& data) {
+  return avifROData{data.data(), data.size()};
+}
+avifROData EmptyRoData() { return avifROData{nullptr, 0}; }
+
+// Encodes a small image with the given Exif/XMP payloads.
+testutil::AvifRwData EncodeWithMetadata(const avifROData& exif,
+                                        const avifROData& xmp) {
+  ImagePtr image = testutil::CreateImage(/*width=*/16, /*height=*/12,
+                                         /*depth=*/8, AVIF_PIXEL_FORMAT_YUV444,
+                                         AVIF_PLANES_YUV);
+  if (image == nullptr) return {};
+  testutil::FillImageGradient(image.get());
+  if (exif.size != 0) {
+    EXPECT_EQ(avifImageSetMetadataExif(image.get(), exif.data, exif.size),
+              AVIF_RESULT_OK);
+  }
+  if (xmp.size != 0) {
+    EXPECT_EQ(avifImageSetMetadataXMP(image.get(), xmp.data, xmp.size),
+              AVIF_RESULT_OK);
+  }
+  return testutil::Encode(image.get(), AVIF_SPEED_FASTEST,
+                          AVIF_QUALITY_LOSSLESS);
+}
+
+// Builds a minimal but valid big-endian Exif payload with the given orientation.
+// The payload starts with three bytes of junk so that the TIFF header is *not* at
+// offset 0, exercising the exif_tiff_header_offset handling.
+std::vector<uint8_t> MakeExifPayload(uint8_t orientation,
+                                     uint8_t filler = 0xEE) {
+  std::vector<uint8_t> exif;
+  // Two filler bytes before the TIFF header.
+  exif.push_back(filler);
+  exif.push_back(filler);
+  // TIFF header (big-endian).
+  exif.insert(exif.end(), {'M', 'M', 0, 42});
+  // Offset to the 0th IFD.
+  const uint32_t ifd_offset = 8;
+  exif.push_back((ifd_offset >> 24) & 0xFF);
+  exif.push_back((ifd_offset >> 16) & 0xFF);
+  exif.push_back((ifd_offset >> 8) & 0xFF);
+  exif.push_back(ifd_offset & 0xFF);
+  // IFD: one entry (the orientation tag).
+  exif.push_back(0);  // field_count high
+  exif.push_back(1);  // field_count low
+  // Tag 0x0112 (Orientation), type 3 (SHORT), count 1.
+  exif.insert(exif.end(), {0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01});
+  // Value: big-endian SHORT plus two padding bytes.
+  exif.push_back(0x00);
+  exif.push_back(orientation);
+  exif.push_back(0x00);
+  exif.push_back(0x00);
+  // Offset to the next IFD.
+  exif.insert(exif.end(), {0x00, 0x00, 0x00, 0x00});
+  return exif;
+}
+
+std::vector<uint8_t> MakeXmpPayload(const std::string& description) {
+  const std::string xmp =
+      "<?xml version=\"1.0\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+      "<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+      "<dc:description>" +
+      description + "</dc:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+  return std::vector<uint8_t>(xmp.begin(), xmp.end());
+}
+
+// Compares only the coded pixel planes (ignoring all metadata), to prove the
+// rewrite did not recompress anything.
+bool PixelsEqual(const avifImage& a, const avifImage& b) {
+  if (a.width != b.width || a.height != b.height || a.depth != b.depth ||
+      a.yuvFormat != b.yuvFormat || a.yuvRange != b.yuvRange) {
+    return false;
+  }
+  for (avifChannelIndex c :
+       {AVIF_CHAN_Y, AVIF_CHAN_U, AVIF_CHAN_V, AVIF_CHAN_A}) {
+    const uint8_t* row1 = avifImagePlane(&a, c);
+    const uint8_t* row2 = avifImagePlane(&b, c);
+    if ((row1 == nullptr) != (row2 == nullptr)) return false;
+    if (row1 == nullptr) continue;
+    if (avifImagePlaneRowBytes(&a, c) != avifImagePlaneRowBytes(&b, c)) {
+      return false;
+    }
+    const size_t bytes = static_cast<size_t>(avifImagePlaneRowBytes(&a, c)) *
+                         avifImagePlaneHeight(&a, c);
+    if (std::memcmp(row1, row2, bytes) != 0) return false;
+  }
+  return true;
+}
+
+// Returns true if `needle` appears in `haystack`. Used to verify the XMP text is
+// readable back byte for byte.
+bool Contains(const avifRWData& haystack, const std::vector<uint8_t>& needle) {
+  if (needle.size() > haystack.size) return false;
+  return std::search(haystack.data, haystack.data + haystack.size,
+                     needle.begin(), needle.end()) !=
+         haystack.data + haystack.size;
+}
+
+}  // namespace
+
+// The core requirement: the AV1 sample bytes must be identical before and after the
+// metadata rewrite, and the new Exif/XMP must be readable back.
+TEST(MetadataRewriteTest, CodedBytesUnchanged) {
+  const std::vector<uint8_t> old_exif = MakeExifPayload(1);
+  const std::vector<uint8_t> old_xmp = MakeXmpPayload("old description");
+  const testutil::AvifRwData encoded =
+      EncodeWithMetadata({old_exif.data(), old_exif.size()},
+                         {old_xmp.data(), old_xmp.size()});
+  ASSERT_NE(encoded.data, nullptr);
+  const avifROData input = RoData(encoded);
+  const ImagePtr original = testutil::Decode(encoded.data, encoded.size);
+  ASSERT_NE(original, nullptr);
+
+  const std::vector<uint8_t> new_exif =
+      MakeExifPayload(6);  // Different orientation, same TIFF layout.
+  const std::vector<uint8_t> new_xmp = MakeXmpPayload(
+      "new description that is noticeably longer than the previous one");
+  const avifROData new_exif_ro = RoData(new_exif);
+  const avifROData new_xmp_ro = RoData(new_xmp);
+  testutil::AvifRwData rewritten;
+  avifMetadataRewriteResult rewrite_result;
+  ASSERT_EQ(avifMetadataRewrite(
+                &input,
+                &new_exif_ro,
+                &new_xmp_ro,
+                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE, &rewrite_result,
+                &rewritten),
+            AVIF_RESULT_OK);
+
+  // The pixels decode identically: no recompression happened.
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+
+  // The new metadata is readable back.
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->exif.data, decoded->exif.size, new_exif.data(), new_exif.size()));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->xmp.data, decoded->xmp.size, new_xmp.data(), new_xmp.size()));
+  const std::vector<uint8_t> description_text = MakeXmpPayload(
+      "new description that is noticeably longer than the previous one");
+  EXPECT_TRUE(Contains(decoded->xmp, description_text));
+
+  // With PRESERVE, the byte payload changed but the orientation interpretation
+  // (irot/imir) did not move.
+  EXPECT_EQ(rewrite_result.previousExifOrientation, 1u);
+  EXPECT_EQ(rewrite_result.newExifOrientation, 6u);
+  EXPECT_FALSE(rewrite_result.orientationPropertiesModified);
+  EXPECT_EQ(decoded->transformFlags & (AVIF_TRANSFORM_IROT | AVIF_TRANSFORM_IMIR),
+            original->transformFlags &
+                (AVIF_TRANSFORM_IROT | AVIF_TRANSFORM_IMIR));
+}
+
+// The new Exif payload has a TIFF header offset that differs from the old one. The
+// 4-byte exif_tiff_header_offset prefix stored in the file must be recomputed, not
+// copied from the previous payload.
+TEST(MetadataRewriteTest, ExifTiffHeaderOffsetRecomputed) {
+  const std::vector<uint8_t> old_exif = MakeExifPayload(1, /*filler=*/0x11);
+  const testutil::AvifRwData encoded =
+      EncodeWithMetadata({old_exif.data(), old_exif.size()},
+                         /*xmp=*/{nullptr, 0});
+  ASSERT_NE(encoded.data, nullptr);
+  const avifROData input = RoData(encoded);
+
+  // Same TIFF content but with four filler bytes instead of two: the TIFF header
+  // is now at offset 4 rather than offset 2.
+  std::vector<uint8_t> new_exif = MakeExifPayload(1, /*filler=*/0x22);
+  new_exif.insert(new_exif.begin(), {0xCC, 0xCC});  // Two extra leading bytes.
+  const avifROData new_exif_ro = RoData(new_exif);
+
+  testutil::AvifRwData rewritten;
+  ASSERT_EQ(avifMetadataRewrite(
+                &input,
+                &new_exif_ro, /*replacementXMP=*/nullptr,
+                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE, /*outResult=*/nullptr,
+                &rewritten),
+            AVIF_RESULT_OK);
+
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->exif.data, decoded->exif.size, new_exif.data(), new_exif.size()));
+  EXPECT_EQ(decoded->exif.data[0], 0xCC);
+  EXPECT_EQ(decoded->exif.data[1], 0xCC);
+  EXPECT_EQ(decoded->exif.data[2], 0x22);
+
+  // The Exif orientation tag is still found by libavif.
+  size_t orientation_offset = 0;
+  ASSERT_EQ(avifGetExifOrientationOffset(decoded->exif.data, decoded->exif.size,
+                                         &orientation_offset),
+            AVIF_RESULT_OK);
+  ASSERT_LT(orientation_offset, decoded->exif.size);
+  EXPECT_EQ(decoded->exif.data[orientation_offset], 1u);
+}
+
+// Exif and XMP moving in opposite directions (one shrinks, the other grows) must
+// not disturb the other items of the file.
+TEST(MetadataRewriteTest, OppositeSizeChangesKeepOtherItems) {
+  const std::vector<uint8_t> big_exif = MakeExifPayload(1);
+  std::vector<uint8_t> padded_exif = big_exif;
+  padded_exif.resize(4096, 0x5A);  // Inflate the old Exif with trailing bytes.
+  const std::vector<uint8_t> small_xmp = MakeXmpPayload("x");
+  const testutil::AvifRwData encoded =
+      EncodeWithMetadata({padded_exif.data(), padded_exif.size()},
+                         {small_xmp.data(), small_xmp.size()});
+  ASSERT_NE(encoded.data, nullptr);
+  const avifROData input = RoData(encoded);
+
+  const std::vector<uint8_t> small_exif = MakeExifPayload(1);
+  const std::vector<uint8_t> big_xmp = MakeXmpPayload(std::string(3000, 'd'));
+  const avifROData small_exif_ro = RoData(small_exif);
+  const avifROData big_xmp_ro = RoData(big_xmp);
+  testutil::AvifRwData rewritten;
+  ASSERT_EQ(avifMetadataRewrite(
+                &input,
+                &small_exif_ro,
+                &big_xmp_ro,
+                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE, /*outResult=*/nullptr,
+                &rewritten),
+            AVIF_RESULT_OK);
+
+  const ImagePtr original = testutil::Decode(encoded.data, encoded.size);
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(original, nullptr);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->exif.data, decoded->exif.size, small_exif.data(),
+      small_exif.size()));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(decoded->xmp.data, decoded->xmp.size,
+                                              big_xmp.data(), big_xmp.size()));
+}
+
+// Following the new Exif orientation updates irot/imir without touching the pixels.
+// Orientation 5 and 7 both map to {irot, imir}, so the property set is unchanged and
+// only the existing irot angle byte moves (mirroring stays around the same axis).
+TEST(MetadataRewriteTest, OrientationFromExif) {
+  const std::vector<uint8_t> old_exif = MakeExifPayload(5);
+  const testutil::AvifRwData encoded =
+      EncodeWithMetadata({old_exif.data(), old_exif.size()},
+                         /*xmp=*/{nullptr, 0});
+  ASSERT_NE(encoded.data, nullptr);
+  const avifROData input = RoData(encoded);
+
+  const ImagePtr original = testutil::Decode(encoded.data, encoded.size);
+  ASSERT_NE(original, nullptr);
+  ASSERT_EQ(original->transformFlags & (AVIF_TRANSFORM_IROT | AVIF_TRANSFORM_IMIR),
+            avifTransformFlags{AVIF_TRANSFORM_IROT | AVIF_TRANSFORM_IMIR});
+  ASSERT_EQ(original->irot.angle, 1u);
+
+  const std::vector<uint8_t> new_exif = MakeExifPayload(7);  // irot.angle = 3.
+  const avifROData new_exif_ro = RoData(new_exif);
+  testutil::AvifRwData rewritten;
+  avifMetadataRewriteResult rewrite_result;
+  ASSERT_EQ(avifMetadataRewrite(&input,
+                                &new_exif_ro,
+                                /*replacementXMP=*/nullptr,
+                                AVIF_METADATA_REWRITE_ORIENTATION_FROM_EXIF,
+                                &rewrite_result, &rewritten),
+            AVIF_RESULT_OK);
+
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  // AV1 samples were not re-encoded, but the orientation property now says "7".
+  EXPECT_EQ(decoded->transformFlags & (AVIF_TRANSFORM_IROT | AVIF_TRANSFORM_IMIR),
+            avifTransformFlags{AVIF_TRANSFORM_IROT | AVIF_TRANSFORM_IMIR});
+  EXPECT_EQ(decoded->irot.angle, 3u);
+  EXPECT_EQ(decoded->imir.axis, 0u);
+  EXPECT_EQ(rewrite_result.previousExifOrientation, 5u);
+  EXPECT_EQ(rewrite_result.newExifOrientation, 7u);
+  EXPECT_TRUE(rewrite_result.orientationPropertiesModified);
+
+  // Decoding the rewritten file must still yield the same pixel bytes: the rotation
+  // is metadata, not a resample.
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+}
+
+// Rewriting through an auxiliary program name attached to the primary item: an
+// alpha auxiliary item must still be decodable after the rewrite.
+TEST(MetadataRewriteTest, AlphaItemUnaffected) {
+  ImagePtr image = testutil::CreateImage(/*width=*/16, /*height=*/12,
+                                         /*depth=*/8, AVIF_PIXEL_FORMAT_YUV444,
+                                         AVIF_PLANES_ALL);
+  ASSERT_NE(image, nullptr);
+  testutil::FillImageGradient(image.get());
+  const std::vector<uint8_t> old_exif = MakeExifPayload(1);
+  ASSERT_EQ(avifImageSetMetadataExif(image.get(), old_exif.data(),
+                                     old_exif.size()),
+            AVIF_RESULT_OK);
+  const testutil::AvifRwData encoded =
+      testutil::Encode(image.get(), AVIF_SPEED_FASTEST);
+  ASSERT_NE(encoded.data, nullptr);
+  const avifROData input = RoData(encoded);
+
+  const std::vector<uint8_t> new_exif = MakeExifPayload(1, /*filler=*/0x33);
+  const avifROData new_exif_ro = RoData(new_exif);
+  testutil::AvifRwData rewritten;
+  ASSERT_EQ(avifMetadataRewrite(
+                &input,
+                &new_exif_ro,
+                /*replacementXMP=*/nullptr,
+                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE, nullptr, &rewritten),
+            AVIF_RESULT_OK);
+
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  ASSERT_NE(decoded->alphaPlane, nullptr);
+  const ImagePtr original = testutil::Decode(encoded.data, encoded.size);
+  ASSERT_NE(original, nullptr);
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+}
+
+// In an image sequence, the Exif/XMP payloads are stored twice: once in the root meta box
+// and once in the color track's own meta box. The decoder reads the track copy, so both
+// copies must be rewritten for the new values to be observable after decoding.
+TEST(MetadataRewriteTest, AnimatedTrackMetadataUpdated) {
+  const std::string path =
+      std::string(data_path) + "colors-animated-8bpc-alpha-exif-xmp.avif";
+  const testutil::AvifRwData file = testutil::ReadFile(path);
+  ASSERT_NE(file.data, nullptr);
+  const ImagePtr original = testutil::DecodeFile(path);
+  ASSERT_NE(original, nullptr);
+
+  const std::vector<uint8_t> new_exif = MakeExifPayload(6, /*filler=*/0x77);
+  const std::vector<uint8_t> new_xmp = MakeXmpPayload("archive sequence description");
+  const avifROData input = RoData(file);
+  const avifROData new_exif_ro = RoData(new_exif);
+  const avifROData new_xmp_ro = RoData(new_xmp);
+  testutil::AvifRwData rewritten;
+  ASSERT_EQ(avifMetadataRewrite(&input, &new_exif_ro, &new_xmp_ro,
+                                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE,
+                                /*outResult=*/nullptr, &rewritten),
+            AVIF_RESULT_OK);
+
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+  // The values read back by the decoder are the new ones, for the track copy too.
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->exif.data, decoded->exif.size, new_exif.data(), new_exif.size()));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->xmp.data, decoded->xmp.size, new_xmp.data(), new_xmp.size()));
+}
+
+// The rewrite must work on files whose primary image is stored as an item with a real
+// pre-existing Exif and XMP payload (not the synthetic ones from this test).
+TEST(MetadataRewriteTest, RealStillFileRoundTrip) {
+  const std::string path = std::string(data_path) + "paris_icc_exif_xmp.avif";
+  const testutil::AvifRwData file = testutil::ReadFile(path);
+  ASSERT_NE(file.data, nullptr);
+  const ImagePtr original = testutil::DecodeFile(path);
+  ASSERT_NE(original, nullptr);
+
+  const std::vector<uint8_t> new_exif = MakeExifPayload(3, /*filler=*/0x55);
+  const std::vector<uint8_t> new_xmp = MakeXmpPayload("archive still description");
+  const avifROData input = RoData(file);
+  const avifROData new_xmp_ro = RoData(new_xmp);
+  const avifROData new_exif_ro = RoData(new_exif);
+  testutil::AvifRwData rewritten;
+  avifMetadataRewriteResult rewrite_result;
+  ASSERT_EQ(avifMetadataRewrite(&input, &new_exif_ro, &new_xmp_ro,
+                                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE,
+                                &rewrite_result, &rewritten),
+            AVIF_RESULT_OK);
+  EXPECT_EQ(rewrite_result.previousExifOrientation, 1u);
+  EXPECT_EQ(rewrite_result.newExifOrientation, 3u);
+
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->exif.data, decoded->exif.size, new_exif.data(), new_exif.size()));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->xmp.data, decoded->xmp.size, new_xmp.data(), new_xmp.size()));
+  // The ICC profile is untouched.
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(original->icc, decoded->icc));
+}
+
+// A file whose last top-level box uses size 0 (extends to end of file) must still be
+// rewritable: the size field is patched so the new mdat becomes a proper sibling.
+TEST(MetadataRewriteTest, TrailingSizeZeroBox) {
+  const std::vector<uint8_t> old_exif = MakeExifPayload(1);
+  const testutil::AvifRwData encoded =
+      EncodeWithMetadata({old_exif.data(), old_exif.size()}, {nullptr, 0});
+  ASSERT_NE(encoded.data, nullptr);
+
+  // The last top-level box of the encoded file is its mdat. Zero its size field.
+  size_t mdat_pos = SIZE_MAX;
+  size_t pos = 0;
+  while (pos + 8 <= encoded.size) {
+    uint32_t size = (static_cast<uint32_t>(encoded.data[pos]) << 24) |
+                    (static_cast<uint32_t>(encoded.data[pos + 1]) << 16) |
+                    (static_cast<uint32_t>(encoded.data[pos + 2]) << 8) |
+                    encoded.data[pos + 3];
+    if (std::memcmp(encoded.data + pos + 4, "mdat", 4) == 0) {
+      mdat_pos = pos;
+    }
+    if (size < 8) break;
+    pos += size;
+  }
+  ASSERT_NE(mdat_pos, SIZE_MAX);
+  std::vector<uint8_t> zero_sized(encoded.data, encoded.data + encoded.size);
+  zero_sized[mdat_pos] = zero_sized[mdat_pos + 1] = 0;
+  zero_sized[mdat_pos + 2] = zero_sized[mdat_pos + 3] = 0;
+  const avifROData input = {zero_sized.data(), zero_sized.size()};
+  const ImagePtr original = testutil::Decode(zero_sized.data(), zero_sized.size());
+  ASSERT_NE(original, nullptr);
+
+  const std::vector<uint8_t> new_exif = MakeExifPayload(2, /*filler=*/0x44);
+  const avifROData new_exif_ro = RoData(new_exif);
+  testutil::AvifRwData rewritten;
+  ASSERT_EQ(avifMetadataRewrite(&input, &new_exif_ro, nullptr,
+                                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE,
+                                nullptr, &rewritten),
+            AVIF_RESULT_OK);
+
+  const ImagePtr decoded = testutil::Decode(rewritten.data, rewritten.size);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_TRUE(PixelsEqual(*original, *decoded));
+  EXPECT_TRUE(testutil::AreByteSequencesEqual(
+      decoded->exif.data, decoded->exif.size, new_exif.data(), new_exif.size()));
+}
+
+// Invalid inputs are rejected without producing output.
+TEST(MetadataRewriteTest, RejectsInvalidArguments) {
+  testutil::AvifRwData encoded{};
+  {
+    const std::vector<uint8_t> exif = MakeExifPayload(1);
+    const testutil::AvifRwData tmp =
+        EncodeWithMetadata({exif.data(), exif.size()}, {nullptr, 0});
+    ASSERT_EQ(avifRWDataSet(&encoded, tmp.data, tmp.size), AVIF_RESULT_OK);
+  }
+  testutil::AvifRwData output;
+  const std::vector<uint8_t> exif = MakeExifPayload(1);
+  const avifROData input = RoData(encoded);
+  const avifROData exif_ro = RoData(exif);
+  const avifROData empty_ro = EmptyRoData();
+
+  // No replacement at all.
+  EXPECT_EQ(avifMetadataRewrite(&input, nullptr,
+                                nullptr,
+                                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE,
+                                nullptr, &output),
+            AVIF_RESULT_INVALID_ARGUMENT);
+  // Empty input.
+  EXPECT_EQ(avifMetadataRewrite(&empty_ro,
+                                &exif_ro, nullptr,
+                                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE,
+                                nullptr, &output),
+            AVIF_RESULT_INVALID_ARGUMENT);
+  // Invalid Exif payload (no TIFF header).
+  const uint8_t kNotExif[] = {1, 2, 3, 4, 5, 6};
+  const avifROData not_exif_ro = avifROData{kNotExif, sizeof(kNotExif)};
+  EXPECT_EQ(avifMetadataRewrite(&input,
+                                &not_exif_ro, nullptr,
+                                AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE,
+                                nullptr, &output),
+            AVIF_RESULT_INVALID_EXIF_PAYLOAD);
+  EXPECT_EQ(output.data, nullptr);
+  EXPECT_EQ(output.size, 0u);
+}
+
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
 
 TEST(MetadataTest, ExtendedXMP) {
   const ImagePtr image =

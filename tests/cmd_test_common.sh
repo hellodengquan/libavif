@@ -44,9 +44,11 @@ fi
 if [[ ! -z "$CONFIG" ]]; then
   AVIFENC="${BINARY_DIR}/${CONFIG}/avifenc"
   AVIFDEC="${BINARY_DIR}/${CONFIG}/avifdec"
+  AVIFMETADATA="${BINARY_DIR}/${CONFIG}/avifmetadata"
   ARE_IMAGES_EQUAL="${BINARY_DIR}/tests/${CONFIG}/are_images_equal"
 else
   AVIFENC="${BINARY_DIR}/avifenc"
   AVIFDEC="${BINARY_DIR}/avifdec"
+  AVIFMETADATA="${BINARY_DIR}/avifmetadata"
   ARE_IMAGES_EQUAL="${BINARY_DIR}/tests/are_images_equal"
 fi

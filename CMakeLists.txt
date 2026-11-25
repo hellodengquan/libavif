@@ -368,6 +368,7 @@ set(AVIF_SRCS
     src/gainmap.c
     src/io.c
     src/mem.c
+    src/metadata.c
     src/obu.c
     src/properties.c
     src/rawdata.c
@@ -714,6 +715,19 @@ if(AVIF_BUILD_APPS)
     endif()
     target_link_libraries(avifdec avif_apps avif avif_enable_warnings)
 
+    add_executable(avifmetadata apps/avifmetadata.c)
+    if(WIN32)
+        if(MSVC)
+            target_sources(avifmetadata PRIVATE apps/utf8.manifest)
+        elseif(MINGW)
+            target_sources(avifmetadata PRIVATE apps/utf8.rc)
+        endif()
+    endif()
+    if(AVIF_LIB_USE_CXX)
+        set_target_properties(avifmetadata PROPERTIES LINKER_LANGUAGE "CXX")
+    endif()
+    target_link_libraries(avifmetadata avif_apps avif avif_enable_warnings)
+
     include(LocalLibargparse)
 
     set(AVIFGAINMAPUTIL_SRCS
@@ -745,7 +759,7 @@ if(AVIF_BUILD_APPS)
 
     if(NOT SKIP_INSTALL_APPS AND NOT SKIP_INSTALL_ALL)
         install(
-            TARGETS avifenc avifdec avifgainmaputil
+            TARGETS avifenc avifdec avifmetadata avifgainmaputil
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
             ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
             LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
@@ -780,7 +794,7 @@ if(AVIF_BUILD_MAN_PAGES)
             message(FATAL_ERROR "libavif: Pandoc is missing, bailing out")
         endif()
 
-        set(MAN_PAGES avifenc.1 avifdec.1)
+        set(MAN_PAGES avifenc.1 avifdec.1 avifmetadata.1)
 
         foreach(MAN_PAGE ${MAN_PAGES})
             add_custom_command(

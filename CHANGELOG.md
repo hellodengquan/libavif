@@ -18,6 +18,11 @@ The changes are relative to the previous release, unless the baseline is specifi
 * avifgainmaputil: add --ignore-exif and --ignore-xmp flags
 * avifdec: add --ignore-exif and --ignore-xmp flags
 * avifgainmaputil: add --matrix-gain-map flag to combine command
+* Add avifMetadataRewrite() to replace the Exif and/or XMP payloads of the
+  primary item of an existing AVIF file without decoding or re-encoding the AV1
+  samples. The existing meta box is patched in place and the new payloads are
+  appended in a new mdat box, so the coded picture, the alpha item, the gain map,
+  grid tiles and track data keep their original bytes.
 
 ### Changed since 1.4.2
 

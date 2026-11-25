@@ -1730,6 +1730,75 @@ AVIF_API uint32_t avifImagePlaneHeight(const avifImage * image, int channel);
 AVIF_NODISCARD AVIF_API avifBool avifPeekCompatibleFileType(const avifROData * input);
 
 // ---------------------------------------------------------------------------
+// Metadata rewriting
+
+// Controls what happens to the primary item's orientation when the Exif payload is replaced.
+// The 'irot'/'imir' item properties (see avifImage.transformFlags) are the orientation
+// actually honored by AVIF decoders; the Exif Orientation tag is only advisory. Rewriting
+// the Exif must therefore not silently change how the pixels are displayed.
+typedef enum avifMetadataRewriteOrientation
+{
+    // Keep the existing irot/imir properties untouched, even if the new Exif payload carries
+    // a different Orientation tag. This is the safe default: the displayed image orientation
+    // is exactly the same as before the rewrite, and the discrepancy (if any) is reported
+    // through avifMetadataRewriteResult.
+    AVIF_METADATA_REWRITE_ORIENTATION_PRESERVE = 0,
+
+    // If the new Exif payload contains an Orientation tag, derive irot/imir from it and
+    // overwrite the primary item's existing transform property values, so that the rendered
+    // orientation follows the newly written Exif. The AV1 samples are still untouched; only
+    // value bytes in the existing 'irot'/'imir' boxes in the 'meta' box change. If following
+    // the new orientation would require adding or removing an 'irot'/'imir' property (which
+    // would resize the meta box), the rewrite fails with AVIF_RESULT_NOT_IMPLEMENTED.
+    AVIF_METADATA_REWRITE_ORIENTATION_FROM_EXIF = 1
+} avifMetadataRewriteOrientation;
+
+// Describes how a rewrite changed the primary item's orientation, for auditability.
+typedef struct avifMetadataRewriteResult
+{
+    // The Exif Orientation tag (1-8) found in the input file, or 0 if there was no Exif item,
+    // no Orientation tag, or the value was out of range.
+    uint8_t previousExifOrientation;
+    // The Exif Orientation tag (1-8) found in the replacement Exif payload, or 0 if the Exif
+    // item was removed or had no usable Orientation tag.
+    uint8_t newExifOrientation;
+    // True if the primary item's irot/imir properties were modified.
+    avifBool orientationPropertiesModified;
+} avifMetadataRewriteResult;
+
+// Updates the Exif and/or XMP payloads of the primary item of an AVIF file without
+// re-encoding, re-compressing or otherwise modifying the coded AV1 sample bytes.
+//
+// input is the complete existing AVIF file. replacementExif and replacementXMP hold the new
+// payloads. Passing NULL for either leaves that payload untouched; a non-NULL replacement
+// must not be empty. The Exif payload is the raw TIFF/Exif byte sequence as exposed by
+// avifImage.exif after decoding (the 4-byte exif_tiff_header_offset field of the ExifDataBlock
+// is added automatically and recomputed from the new payload).
+//
+// output receives the rewritten file and must be freed with avifRWDataFree() by the caller.
+// It is left empty on error and may not alias input. On success, *outResult (if non-NULL) is
+// filled in with the previous and new Exif orientation and whether irot/imir changed.
+//
+// The input file is copied unchanged and the new payloads are appended in a new MediaDataBox
+// at the end of the file. Only the 'iloc' extent offset and length of the Exif/XMP items are
+// patched in place. As a result the coded picture, the alpha item, the gain map item, grid
+// tiles and track data keep their original bytes and absolute positions, and the size of the
+// 'meta' box does not change. If the primary image is stored in an image sequence, the Exif/XMP
+// payloads that a decoder would read from the color track's own 'meta' box are patched too, so
+// both items and tracks expose the new values.
+//
+// The primary item's irot/imir properties are left byte-for-byte unchanged by default (see
+// orientationMode). Files without an existing Exif or XMP item to replace, files that store
+// the metadata item inside an 'idat' box, and files that use multiple extents per item are
+// rejected with an error rather than silently mangled.
+AVIF_API avifResult avifMetadataRewrite(const avifROData * input,
+                                        const avifROData * replacementExif,
+                                        const avifROData * replacementXMP,
+                                        avifMetadataRewriteOrientation orientationMode,
+                                        avifMetadataRewriteResult * outResult,
+                                        avifRWData * output);
+
+// ---------------------------------------------------------------------------
 // Gain Map utilities.
 
 // Performs tone mapping on a base image using the provided gain map.
