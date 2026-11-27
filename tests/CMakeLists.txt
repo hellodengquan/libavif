@@ -91,6 +91,7 @@ if(AVIF_GTEST)
     add_avif_gtest_with_data(avifcolrconverttest)
     add_avif_gtest(avifcolrtest)
     add_avif_gtest_with_data(avifdecodetest)
+    add_avif_gtest(avifdecodesizetest)
     add_avif_gtest_with_data(avifdimgtest avifincrtest_helpers)
     add_avif_gtest_with_data(avifencodetest)
     add_avif_gtest_with_data(avifgainmaptest avifincrtest_helpers)
@@ -150,6 +151,7 @@ if(AVIF_GTEST)
             # these tests are disabled because other codecs may not implement all the necessary features.
             # For example, SVT-AV1 requires 4:2:0 images with even dimensions of at least 64x64 px.
             avifallocationtest
+            avifdecodesizetest
             avifgridapitest
             avifincrtest
             aviflosslesstest
